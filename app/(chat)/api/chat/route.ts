@@ -1,163 +1,323 @@
-// app/api/generate/route.ts
-import { NextResponse } from "next/server";
-import OpenAI from "openai";
-import { z } from "zod";
+import { geolocation } from "@vercel/functions";
+import {
+  convertToModelMessages,
+  createUIMessageStream,
+  JsonToSseTransformStream,
+  smoothStream,
+  stepCountIs,
+  streamText,
+} from "ai";
+import { unstable_cache as cache } from "next/cache";
+import { after } from "next/server";
+import {
+  createResumableStreamContext,
+  type ResumableStreamContext,
+} from "resumable-stream";
+import type { ModelCatalog } from "tokenlens/core";
+import { fetchModels } from "tokenlens/fetch";
+import { getUsage } from "tokenlens/helpers";
+import { auth, type UserType } from "@/app/(auth)/auth";
+import type { VisibilityType } from "@/components/visibility-selector";
+import { entitlementsByUserType } from "@/lib/ai/entitlements";
+import type { ChatModel } from "@/lib/ai/models";
+import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
+import { myProvider } from "@/lib/ai/providers";
+import { createDocument } from "@/lib/ai/tools/create-document";
+import { getWeather } from "@/lib/ai/tools/get-weather";
+import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
+import { updateDocument } from "@/lib/ai/tools/update-document";
+import { isProductionEnvironment } from "@/lib/constants";
+import {
+  createStreamId,
+  deleteChatById,
+  getChatById,
+  getMessageCountByUserId,
+  getMessagesByChatId,
+  saveChat,
+  saveMessages,
+  updateChatLastContextById,
+} from "@/lib/db/queries";
+import { ChatSDKError } from "@/lib/errors";
+import type { ChatMessage } from "@/lib/types";
+import type { AppUsage } from "@/lib/usage";
+import { convertToUIMessages, generateUUID } from "@/lib/utils";
+import { generateTitleFromUserMessage } from "../../actions";
+import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+let globalStreamContext: ResumableStreamContext | null = null;
 
-// Define the Zod schema for validating the creative response
-const CreativeSchema = z.object({
-  platform: z.enum(["facebook", "instagram", "tiktok", "youtube", "google_display"]),
-  product_or_service: z.string(),
-  audience: z.array(z.string()).min(1),
-  angles: z.array(z.string()).min(2),
-  primary_text: z.string(),
-  headline: z.string(),
-  description: z.string(),
-  cta: z.string(),
-  hashtags: z.array(z.string()).optional(),
-  image_prompts: z.array(z.string()).min(2),
-  video_script: z.object({
-    duration_seconds: z.number().int().min(10).max(60),
-    beats: z.array(
-      z.object({
-        timestamp: z.string(),
-        shot: z.string(),
-        voiceover: z.string(),
-      })
-    ).min(4),
-  }),
-});
-
-// JSON schema for OpenAI’s structured response
-const jsonSchema = {
-  name: "AdCreative",
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      platform: { enum: ["facebook", "instagram", "tiktok", "youtube", "google_display"] },
-      product_or_service: { type: "string" },
-      audience: { type: "array", items: { type: "string" }, minItems: 1 },
-      angles: { type: "array", items: { type: "string" }, minItems: 2 },
-      primary_text: { type: "string" },
-      headline: { type: "string" },
-      description: { type: "string" },
-      cta: { type: "string" },
-      hashtags: { type: "array", items: { type: "string" } },
-      image_prompts: { type: "array", items: { type: "string" }, minItems: 2 },
-      video_script: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          duration_seconds: { type: "integer", minimum: 10, maximum: 60 },
-          beats: {
-            type: "array",
-            minItems: 4,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                timestamp: { type: "string" },
-                shot: { type: "string" },
-                voiceover: { type: "string" },
-              },
-              required: ["timestamp", "shot", "voiceover"],
-            },
-          },
-        },
-        required: ["duration_seconds", "beats"],
-      },
-    },
-    required: [
-      "platform",
-      "product_or_service",
-      "audience",
-      "angles",
-      "primary_text",
-      "headline",
-      "description",
-      "cta",
-      "image_prompts",
-      "video_script",
-    ],
+const getTokenlensCatalog = cache(
+  async (): Promise<ModelCatalog | undefined> => {
+    try {
+      return await fetchModels();
+    } catch (err) {
+      console.warn(
+        "TokenLens: catalog fetch failed, using default catalog",
+        err
+      );
+      return; // tokenlens helpers will fall back to defaultCatalog
+    }
   },
-  strict: true,
-} as const;
+  ["tokenlens-catalog"],
+  { revalidate: 24 * 60 * 60 } // 24 hours
+);
 
-export const GET = async () =>
-  NextResponse.json({
-    ok: true,
-    message: "POST { prompt, platform } to this endpoint to generate ad creatives.",
-  });
-
-export const POST = async (req: Request) => {
-  // Ensure the API key is set
-  if (!process.env.OPENAI_API_KEY) {
-    return NextResponse.json({ error: "Missing OPENAI_API_KEY" }, { status: 500 });
+export function getStreamContext() {
+  if (!globalStreamContext) {
+    try {
+      globalStreamContext = createResumableStreamContext({
+        waitUntil: after,
+      });
+    } catch (error: any) {
+      if (error.message.includes("REDIS_URL")) {
+        console.log(
+          " > Resumable streams are disabled due to missing REDIS_URL"
+        );
+      } else {
+        console.error(error);
+      }
+    }
   }
 
-  let body: any;
+  return globalStreamContext;
+}
+
+export async function POST(request: Request) {
+  let requestBody: PostRequestBody;
+
   try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const { prompt, platform = "facebook" } = body || {};
-  if (!prompt || typeof prompt !== "string") {
-    return NextResponse.json({ error: "Missing required field: prompt" }, { status: 400 });
+    const json = await request.json();
+    requestBody = postRequestBodySchema.parse(json);
+  } catch (_) {
+    return new ChatSDKError("bad_request:api").toResponse();
   }
 
   try {
-    // Compose the request with a professional ad‑creative system prompt
-    const aiReq: any = {
-      model: "gpt-4o-mini",
-      input: [
-        {
-          role: "system",
-          content:
-            "You are a professional direct-response ad creative expert. Your job is to generate high-converting ad copy and ideas for the specified platform and product or service. Use persuasive hooks, emotional triggers, and clear calls to action. Follow platform guidelines (e.g. character limits, no policy violations) and provide the result as structured JSON matching the provided schema exactly.",
-        },
-        {
-          role: "user",
-          content: [
-            `Brief: ${prompt}`,
-            `Platform: ${platform}`,
-            "Tone: direct-response",
-            "Locale: en-US",
-            "Constraints: Keep primary text ≤ 550 chars (Meta), headline ≤ 60, description ≤ 90. Include ≥ 2 image prompts and a short UGC video outline.",
-          ].join("\n"),
-        },
-      ],
-      response_format: { type: "json_schema", json_schema: jsonSchema },
+    const {
+      id,
+      message,
+      selectedChatModel,
+      selectedVisibilityType,
+    }: {
+      id: string;
+      message: ChatMessage;
+      selectedChatModel: ChatModel["id"];
+      selectedVisibilityType: VisibilityType;
+    } = requestBody;
+
+    const session = await auth();
+
+    if (!session?.user) {
+      return new ChatSDKError("unauthorized:chat").toResponse();
+    }
+
+    const userType: UserType = session.user.type;
+
+    const messageCount = await getMessageCountByUserId({
+      id: session.user.id,
+      differenceInHours: 24,
+    });
+
+    if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
+      return new ChatSDKError("rate_limit:chat").toResponse();
+    }
+
+    const chat = await getChatById({ id });
+
+    if (chat) {
+      if (chat.userId !== session.user.id) {
+        return new ChatSDKError("forbidden:chat").toResponse();
+      }
+    } else {
+      const title = await generateTitleFromUserMessage({
+        message,
+      });
+
+      await saveChat({
+        id,
+        userId: session.user.id,
+        title,
+        visibility: selectedVisibilityType,
+      });
+    }
+
+    const messagesFromDb = await getMessagesByChatId({ id });
+    const uiMessages = [...convertToUIMessages(messagesFromDb), message];
+
+    const { longitude, latitude, city, country } = geolocation(request);
+
+    const requestHints: RequestHints = {
+      longitude,
+      latitude,
+      city,
+      country,
     };
 
-    const aiRes = await (openai as any).responses.create(aiReq);
-    const outputText: string = (aiRes as any).output_text;
-    let creative: unknown;
-    try {
-      creative = JSON.parse(outputText);
-    } catch {
-      return NextResponse.json({ error: "Model returned non-JSON", raw: outputText }, { status: 502 });
+    await saveMessages({
+      messages: [
+        {
+          chatId: id,
+          id: message.id,
+          role: "user",
+          parts: message.parts,
+          attachments: [],
+          createdAt: new Date(),
+        },
+      ],
+    });
+
+    const streamId = generateUUID();
+    await createStreamId({ streamId, chatId: id });
+
+    let finalMergedUsage: AppUsage | undefined;
+
+    const stream = createUIMessageStream({
+      execute: ({ writer: dataStream }) => {
+        const result = streamText({
+          model: myProvider.languageModel(selectedChatModel),
+          system: systemPrompt({ selectedChatModel, requestHints }),
+          messages: convertToModelMessages(uiMessages),
+          stopWhen: stepCountIs(5),
+          experimental_activeTools:
+            selectedChatModel === "chat-model-reasoning"
+              ? []
+              : [
+                  "getWeather",
+                  "createDocument",
+                  "updateDocument",
+                  "requestSuggestions",
+                ],
+          experimental_transform: smoothStream({ chunking: "word" }),
+          tools: {
+            getWeather,
+            createDocument: createDocument({ session, dataStream }),
+            updateDocument: updateDocument({ session, dataStream }),
+            requestSuggestions: requestSuggestions({
+              session,
+              dataStream,
+            }),
+          },
+          experimental_telemetry: {
+            isEnabled: isProductionEnvironment,
+            functionId: "stream-text",
+          },
+          onFinish: async ({ usage }) => {
+            try {
+              const providers = await getTokenlensCatalog();
+              const modelId =
+                myProvider.languageModel(selectedChatModel).modelId;
+              if (!modelId) {
+                finalMergedUsage = usage;
+                dataStream.write({
+                  type: "data-usage",
+                  data: finalMergedUsage,
+                });
+                return;
+              }
+
+              if (!providers) {
+                finalMergedUsage = usage;
+                dataStream.write({
+                  type: "data-usage",
+                  data: finalMergedUsage,
+                });
+                return;
+              }
+
+              const summary = getUsage({ modelId, usage, providers });
+              finalMergedUsage = { ...usage, ...summary, modelId } as AppUsage;
+              dataStream.write({ type: "data-usage", data: finalMergedUsage });
+            } catch (err) {
+              console.warn("TokenLens enrichment failed", err);
+              finalMergedUsage = usage;
+              dataStream.write({ type: "data-usage", data: finalMergedUsage });
+            }
+          },
+        });
+
+        result.consumeStream();
+
+        dataStream.merge(
+          result.toUIMessageStream({
+            sendReasoning: true,
+          })
+        );
+      },
+      generateId: generateUUID,
+      onFinish: async ({ messages }) => {
+        await saveMessages({
+          messages: messages.map((currentMessage) => ({
+            id: currentMessage.id,
+            role: currentMessage.role,
+            parts: currentMessage.parts,
+            createdAt: new Date(),
+            attachments: [],
+            chatId: id,
+          })),
+        });
+
+        if (finalMergedUsage) {
+          try {
+            await updateChatLastContextById({
+              chatId: id,
+              context: finalMergedUsage,
+            });
+          } catch (err) {
+            console.warn("Unable to persist last usage for chat", id, err);
+          }
+        }
+      },
+      onError: () => {
+        return "Oops, an error occurred!";
+      },
+    });
+
+    return new Response(stream.pipeThrough(new JsonToSseTransformStream()));
+  } catch (error) {
+    const vercelId = request.headers.get("x-vercel-id");
+
+    if (error instanceof ChatSDKError) {
+      return error.toResponse();
     }
 
-    const parsed = CreativeSchema.safeParse(creative);
-    if (!parsed.success) {
-      return NextResponse.json(
-        { error: "Schema validation failed", issues: parsed.error.issues },
-        { status: 502 }
-      );
+    // Check for Vercel AI Gateway credit card error
+    if (
+      error instanceof Error &&
+      error.message?.includes(
+        "AI Gateway requires a valid credit card on file to service requests"
+      )
+    ) {
+      return new ChatSDKError("bad_request:activate_gateway").toResponse();
     }
 
-    return NextResponse.json({ ok: true, creative: parsed.data });
-  } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message ?? "Unexpected error calling OpenAI" },
-      { status: 500 }
-    );
+    console.error("Unhandled error in chat API:", error, { vercelId });
+    return new ChatSDKError("offline:chat").toResponse();
   }
-};
+}
+
+export async function DELETE(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const id = searchParams.get("id");
+
+  if (!id) {
+    return new ChatSDKError("bad_request:api").toResponse();
+  }
+
+  const session = await auth();
+
+  if (!session?.user) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
+
+  const chat = await getChatById({ id });
+
+  if (chat?.userId !== session.user.id) {
+    return new ChatSDKError("forbidden:chat").toResponse();
+  }
+
+  const deletedChat = await deleteChatById({ id });
+
+  return Response.json(deletedChat, { status: 200 });
+}
