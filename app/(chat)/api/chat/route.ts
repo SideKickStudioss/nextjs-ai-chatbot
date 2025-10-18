@@ -93,6 +93,17 @@ export async function POST(request: Request) {
   } catch (_) {
     return new ChatSDKError("bad_request:api").toResponse();
   }
+  // inside POST in app/api/chat/route.ts, right before streamText(...)
+  const lastUserMessage = message?.parts?.map(p => p.text).join(" ") ?? "";
+  const platformMatch = /platform\s*:\s*(facebook|instagram|tiktok|youtube|google_display)/i.exec(lastUserMessage);
+  const platform = (platformMatch?.[1]?.toLowerCase() as any) || "facebook";
+
+  const result = streamText({
+    model: myProvider.languageModel(selectedChatModel),
+    system: systemPrompt({ selectedChatModel, requestHints, platform }),
+    messages: convertToModelMessages(uiMessages),
+  // ...rest stays as is
+  });
 
   try {
     const {
