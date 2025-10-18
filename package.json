@@ -19,8 +19,6 @@
   },
   "dependencies": {
     "@ai-sdk/gateway": "^1.0.15",
-    "openai": "^4.60.0",
-    "zod": "^3.23.8",
     "@ai-sdk/provider": "2.0.0",
     "@ai-sdk/react": "2.0.26",
     "@ai-sdk/xai": "2.0.13",
