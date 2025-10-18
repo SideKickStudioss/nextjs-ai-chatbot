@@ -1,52 +1,35 @@
-import { cookies } from "next/headers";
-import { redirect } from "next/navigation";
-import { Chat } from "@/components/chat";
-import { DataStreamHandler } from "@/components/data-stream-handler";
-import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
-import { generateUUID } from "@/lib/utils";
-import { auth } from "../(auth)/auth";
+// app/chat/page.tsx
+import { cookies } from 'next/headers';
+import { redirect } from 'next/navigation';
+import { getServerSession } from 'next-auth/next'; // or your own auth helper
+import Chat from '@/components/Chat';
+import DataStreamHandler from '@/components/data-stream-handler';
+import { DEFAULT_CHAT_MODEL } from '@/lib/ai/models';
+import { generateUUID } from '@/lib/utils';
 
-export default async function Page() {
-  const session = await auth();
-
+export default async function ChatPage() {
+  const session = await getServerSession();
   if (!session) {
-    redirect("/api/auth/guest");
+    // Redirect unauthenticated users to a guest login route
+    redirect('/api/auth/guest');
   }
 
   const id = generateUUID();
+  const cookieStore = cookies();
+  const model = cookieStore.get('chat-model');
 
-  const cookieStore = await cookies();
-  const modelIdFromCookie = cookieStore.get("chat-model");
-
-  if (!modelIdFromCookie) {
+  if (!model) {
     return (
       <>
-        <Chat
-          autoResume={false}
-          id={id}
-          initialChatModel={DEFAULT_CHAT_MODEL}
-          initialMessages={[]}
-          initialVisibilityType="private"
-          isReadonly={false}
-          key={id}
-        />
+        <Chat id={id} initialChatModel={DEFAULT_CHAT_MODEL}
+              initialMessages={[]} initialVisibilityType="private" autoResume={false} isReady={false} />
         <DataStreamHandler />
       </>
     );
   }
 
   return (
-    <>
-      <Chat
-        autoResume={false}
-        id={id}
-        initialChatModel={modelIdFromCookie.value}
-        initialMessages={[]}
-        initialVisibilityType="private"
-        isReadonly={false}
-        key={id}
-      />
-      <DataStreamHandler />
-    </>
+    <Chat id={id} initialChatModel={model.value}
+          initialMessages={[]} initialVisibilityType="private" autoResume={false} />
   );
 }
